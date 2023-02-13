@@ -774,7 +774,6 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         return result;
     }
 
-    int MAX_READ_MISMATCH_QUALITY_SCORE_SUM = 100;
     private static Character MAPPED_BY_MATE = 'M';
     IndexedFastaSequenceFile refReader;
 
