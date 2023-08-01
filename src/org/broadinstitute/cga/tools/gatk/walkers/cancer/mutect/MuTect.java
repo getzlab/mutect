@@ -774,7 +774,6 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         return result;
     }
 
-    int MAX_READ_MISMATCH_QUALITY_SCORE_SUM = 100;
     private static Character MAPPED_BY_MATE = 'M';
     IndexedFastaSequenceFile refReader;
 
@@ -790,7 +789,6 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
             }
 
             // is this a discordant read pair?
-            // TODO: add option to disable this filter
             if(MTAC.EXCLUDE_CHIMERIC_READS && read.getMateReferenceIndex() != read.getReferenceIndex()) {
                 continue;
             }
@@ -804,7 +802,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                     CGAAlignmentUtils.mismatchesInRefWindow(p, ref, false, true);
 
             // do we have too many mismatches overall?
-            if (mismatchQualitySum > this.MAX_READ_MISMATCH_QUALITY_SCORE_SUM) {
+            if (mismatchQualitySum > MTAC.MAX_READ_MISMATCH_QUALITY_SCORE_SUM) {
                 continue;
             }
 
