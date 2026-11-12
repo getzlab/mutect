@@ -399,8 +399,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
             }
 
             stdCovWriter.writeCoverage(rawContext, isBaseCovered);
-            int tumorQ20BaseCount = tumorReadPile.getFilteredBaseCount(20);
-            int normalQ20BaseCount = normalReadPile.getFilteredBaseCount(20);
+            int tumorQ20BaseCount = tumorReadPile.getFinalPileupQ20Depth();
+            int normalQ20BaseCount = normalReadPile.getFinalPileupQ20Depth();
             q20CovWriter.writeCoverage(rawContext, tumorQ20BaseCount  >= 20 &&  normalQ20BaseCount >= 20);
             tumorDepthWriter.writeCoverage(rawContext, tumorBaseCount);
             normalDepthWriter.writeCoverage(rawContext, normalBaseCount);
@@ -422,12 +422,12 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
             int mapQ0Reads =
-                    tumorReadPile.qualityScoreFilteredPileup.getNumberOfMappingQualityZeroReads() +
-                            normalReadPile.qualityScoreFilteredPileup.getNumberOfMappingQualityZeroReads();
+                    tumorReadPile.getQualityScoreFilteredMappingQualityZeroCount() +
+                            normalReadPile.getQualityScoreFilteredMappingQualityZeroCount();
 
             int totalReads =
-                    tumorReadPile.qualityScoreFilteredPileup.depthOfCoverage() +
-                            normalReadPile.qualityScoreFilteredPileup.depthOfCoverage();
+                    tumorReadPile.getQualityScoreFilteredDepth() +
+                            normalReadPile.getQualityScoreFilteredDepth();
 
             // the following do not depend on the alternate allele being tested, so they are calculated
             // at most once per locus, the first time a candidate needs them
@@ -500,8 +500,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 VariableAllelicRatioGenotypeLikelihoods contaminantLikelihoods
                         = new VariableAllelicRatioGenotypeLikelihoods(upRef, contaminantF);
 
-                List<PileupElement> peList = new ArrayList<PileupElement>(tumorReadPile.finalPileup.depthOfCoverage());
-                for(PileupElement pe : tumorReadPile.finalPileup) {
+                List<PileupElement> peList = new ArrayList<PileupElement>(tumorReadPile.getFinalPileup().depthOfCoverage());
+                for(PileupElement pe : tumorReadPile.getFinalPileup()) {
                     peList.add(pe);
                 }
 
@@ -529,13 +529,13 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
                 if (normalGl == null) {
-                    normalGl = normalReadPile.calculateLikelihoods(normalReadPile.qualityScoreFilteredPileup); // use MAPQ0 reads
+                    normalGl = normalReadPile.calculateLikelihoods(normalReadPile.getQualityScoreFilteredPileup()); // use MAPQ0 reads
                 }
                 candidate.setInitialNormalBestGenotype(normalReadPile.getBestGenotype(normalGl));
                 candidate.setInitialNormalLod(LocusReadPile.getRefVsAlt(normalGl, upRef, altAllele));
 
 
-                double normalF = Math.max(LocusReadPile.estimateAlleleFraction(normalReadPile.qualityScoreFilteredPileup, upRef, altAllele), MTAC.MINIMUM_NORMAL_ALLELE_FRACTION);
+                double normalF = Math.max(LocusReadPile.estimateAlleleFraction(normalReadPile.getQualityScoreFilteredPileup(), upRef, altAllele), MTAC.MINIMUM_NORMAL_ALLELE_FRACTION);
                 candidate.setNormalF(normalF);
 
 
@@ -551,7 +551,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
                 // TODO: parameterize filtering Mate-Rescued Reads (if someone wants to disable this)
                 if (t2 == null) {
-                    t2 = new LocusReadPile(filterReads(ref, tumorReadPile.finalPileup, true, readFilterCache), (char)ref.getBase(), 0, 0, MTAC.ENABLE_QSCORE_OUTPUT);
+                    t2 = new LocusReadPile(filterReads(ref, tumorReadPile.getFinalPileup(), true, readFilterCache), (char)ref.getBase(), 0, 0, MTAC.ENABLE_QSCORE_OUTPUT);
                 }
 
                 // if there are no reads remaining, abandon this theory
@@ -565,7 +565,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 candidate.setTumorAltQualityScores(t2.qualitySums.getBaseQualityScores(altAllele));
                 candidate.setTumorRefQualityScores(t2.qualitySums.getBaseQualityScores(upRef));
 
-                VariableAllelicRatioGenotypeLikelihoods t2Gl = t2.calculateLikelihoods(t2.finalPileup);
+                VariableAllelicRatioGenotypeLikelihoods t2Gl = t2.calculateLikelihoods(t2.getFinalPileup());
                 candidate.setInitialTumorLod(t2.getAltVsRef(t2Gl, upRef, altAllele));
                 candidate.setInitialTumorReadDepth(t2.getFinalPileupDepth());
 
@@ -602,7 +602,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 ArrayList<PileupElement> referencePileupElements = new ArrayList<PileupElement>();
 
 
-                for (PileupElement p : t2.finalPileup) {
+                for (PileupElement p : t2.getFinalPileup()) {
                     // the base in the read at this position (equivalent to read.getReadString().charAt(offset))
                     final char readBase = (char) (p.getRead().getReadBases()[p.getOffset()] & 0xFF);
 

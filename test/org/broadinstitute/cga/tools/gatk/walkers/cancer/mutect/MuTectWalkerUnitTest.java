@@ -128,7 +128,7 @@ public class MuTectWalkerUnitTest extends BaseTest {
 
                     double newLod = tp.calculateAltVsRefLOD((byte) alt, observedF, 0);
 
-                    VariableAllelicRatioGenotypeLikelihoods tumorFStarGl = tp.calculateLikelihoods(observedF, tp.finalPileup);
+                    VariableAllelicRatioGenotypeLikelihoods tumorFStarGl = tp.calculateLikelihoods(observedF, tp.getFinalPileup());
                     double lod = tp.getHetVsRef(tumorFStarGl, (char)ref, (char)alt);
                     
 //                    System.out.println("Using Q="+qScore+" depth="+depth+" alts=" + alts + " trueF = " + f +

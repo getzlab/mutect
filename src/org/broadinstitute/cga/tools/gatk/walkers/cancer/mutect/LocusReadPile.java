@@ -71,9 +71,19 @@ public class LocusReadPile {
     protected int minQSumQualityScore;
     protected QualitySums qualitySums;
 
-    public ReadBackedPileup initialPileup;
-    protected ReadBackedPileup qualityScoreFilteredPileup;
-    public ReadBackedPileup finalPileup;
+    // the pileups derived from noOverlapPileup, built on first use since most loci only need the counts below
+    private ReadBackedPileup initialPileup;               // without deletions
+    private ReadBackedPileup qualityScoreFilteredPileup;  // ... and without bases under minQualityScore
+    private ReadBackedPileup finalPileup;                 // ... and without mapping quality zero reads
+
+    // counts over those pileups, gathered in one pass when the pile is built
+    private int qualityScoreFilteredDepth = 0;
+    private int qualityScoreFilteredMappingQualityZeroCount = 0;
+    private int finalPileupDepth = 0;
+    private int finalPileupQ20Depth = 0;
+    private final int[] finalPileupBaseCounts = new int[4];
+
+    public static final int Q20 = 20;
 
 
     // the strand-specific pileups and the gap event counts are only needed for sites that become
@@ -115,25 +125,82 @@ public class LocusReadPile {
         this.minQualityScore = minQualityScore;
 
         noOverlapPileup = getOverlappingFragmentFilteredPileup(pileup, (byte) refBase, retainOverlapMismatches, overlapTracker);
-        this.initialPileup = noOverlapPileup.getPileupWithoutDeletions();
-        this.qualityScoreFilteredPileup = initialPileup.getBaseFilteredPileup(minQualityScore);
-        this.finalPileup = qualityScoreFilteredPileup.getPileupWithoutMappingQualityZeroReads();
 
-        for (PileupElement p : qualityScoreFilteredPileup) {
-            if (p.getMappingQual() == 0 && !allowMapq0ForQualSum) { continue; }
-            if (p.getQual() <= minQSumQualityScore) { continue; }
+        // one pass gathers everything a locus needs unless it becomes a candidate, applying the same filters in
+        // the same order as getInitialPileup / getQualityScoreFilteredPileup / getFinalPileup do
+        for (PileupElement p : noOverlapPileup) {
+            if (p.isDeletion()) { continue; }                                   // not in initialPileup
 
-            if (p.getQual() > this.minQSumQualityScore) { qualitySums.incrementSum((char)p.getBase(), 1, p.getQual()); }
- 
+            final byte qual = p.getQual();
+            if (qual < minQualityScore) { continue; }                          // not in qualityScoreFilteredPileup
+
+            final int mappingQual = p.getMappingQual();
+            qualityScoreFilteredDepth++;
+            if (mappingQual == 0) { qualityScoreFilteredMappingQualityZeroCount++; }
+
+            if ((mappingQual != 0 || allowMapq0ForQualSum) && qual > minQSumQualityScore) {
+                qualitySums.incrementSum((char) p.getBase(), 1, qual);
+            }
+
+            if (mappingQual > 0) {                                              // in finalPileup
+                finalPileupDepth++;
+                if (qual >= Q20) { finalPileupQ20Depth++; }
+                final int baseIndex = BaseUtils.simpleBaseToBaseIndex((char) p.getBase());
+                if (baseIndex != -1) { finalPileupBaseCounts[baseIndex]++; }
+            }
         }
+    }
 
+    /** the overlap-filtered pileup without deletions */
+    public ReadBackedPileup getInitialPileup() {
+        if (initialPileup == null) {
+            initialPileup = noOverlapPileup.getPileupWithoutDeletions();
+        }
+        return initialPileup;
+    }
+
+    /** the initial pileup without bases under the minimum quality score */
+    public ReadBackedPileup getQualityScoreFilteredPileup() {
+        if (qualityScoreFilteredPileup == null) {
+            qualityScoreFilteredPileup = getInitialPileup().getBaseFilteredPileup(minQualityScore);
+        }
+        return qualityScoreFilteredPileup;
+    }
+
+    /** the quality score filtered pileup without mapping quality zero reads */
+    public ReadBackedPileup getFinalPileup() {
+        if (finalPileup == null) {
+            finalPileup = getQualityScoreFilteredPileup().getPileupWithoutMappingQualityZeroReads();
+        }
+        return finalPileup;
     }
 
     /**
      * @return the number of reads in the final pileup
      */
     public int getFinalPileupDepth() {
-        return finalPileup.getNumberOfElements();
+        return finalPileupDepth;
+    }
+
+    /**
+     * @return the number of reads in the final pileup with base quality of at least 20
+     */
+    public int getFinalPileupQ20Depth() {
+        return finalPileupQ20Depth;
+    }
+
+    /**
+     * @return the number of reads in the quality score filtered pileup
+     */
+    public int getQualityScoreFilteredDepth() {
+        return qualityScoreFilteredDepth;
+    }
+
+    /**
+     * @return the number of mapping quality zero reads in the quality score filtered pileup
+     */
+    public int getQualityScoreFilteredMappingQualityZeroCount() {
+        return qualityScoreFilteredMappingQualityZeroCount;
     }
 
     /**
@@ -318,11 +385,15 @@ public class LocusReadPile {
     }
 
     public double estimateAlleleFraction(char ref, char alt) {
-        return estimateAlleleFraction(this.finalPileup, ref, alt);
+        // from the base counts of the final pileup, gathered when the pile was built
+        return estimateAlleleFraction(finalPileupBaseCounts, ref, alt);
     }
 
     public static double estimateAlleleFraction(ReadBackedPileup pileup, char ref, char alt) {
-        int[] counts = pileup.getBaseCounts();
+        return estimateAlleleFraction(pileup.getBaseCounts(), ref, alt);
+    }
+
+    private static double estimateAlleleFraction(int[] counts, char ref, char alt) {
         double refCount = (double) counts[BaseUtils.simpleBaseToBaseIndex((byte)ref)];
         double altCount = (double) counts[BaseUtils.simpleBaseToBaseIndex((byte)alt)];
         double depth = refCount + altCount;
@@ -330,7 +401,7 @@ public class LocusReadPile {
     }
 
     public double calculateLogLikelihood(byte alt, double f) {
-        return LocusReadPile.calculateLogLikelihood(this.finalPileup, ((byte) this.refBase), alt, f);
+        return LocusReadPile.calculateLogLikelihood(getFinalPileup(), ((byte) this.refBase), alt, f);
     }
 
     public double calculateAltVsRefLOD(ReadBackedPileup pileup, byte alt, double fAlternate, double fReference) {
@@ -344,7 +415,7 @@ public class LocusReadPile {
     }
 
     public double calculateAltVsRefLOD(byte alt, double fAlternate, double fReference) {
-        return calculateAltVsRefLOD(this.finalPileup, alt, fAlternate, fReference);
+        return calculateAltVsRefLOD(getFinalPileup(), alt, fAlternate, fReference);
     }
 
     public double calculateRefVsAltLOD(ReadBackedPileup pileup, byte alt, double fAlternate, double fReference) {
@@ -412,9 +483,9 @@ public class LocusReadPile {
     }
 
     public int getFilteredBaseCount(int minBaseQualityScore) {
-        // equivalent to finalPileup.getBaseFilteredPileup(minBaseQualityScore).depthOfCoverage(), without building the pileup
+        // equivalent to getFinalPileup().getBaseFilteredPileup(minBaseQualityScore).depthOfCoverage(), without building that pileup
         int count = 0;
-        for (PileupElement p : this.finalPileup) {
+        for (PileupElement p : getFinalPileup()) {
             if (p.isDeletion() || p.getQual() >= minBaseQualityScore) { count++; }
         }
         return count;
