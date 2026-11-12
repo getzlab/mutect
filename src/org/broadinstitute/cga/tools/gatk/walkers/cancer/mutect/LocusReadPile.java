@@ -100,17 +100,21 @@ public class LocusReadPile {
     }
 
     public LocusReadPile(ReadBackedPileup pileup, char refBase, int minQualityScore, int minQSumQualityScore, boolean allowMapq0ForQualSum, boolean retainOverlapMismatches, boolean trackBaseQualityScores) {
+        this(pileup, refBase, minQualityScore, minQSumQualityScore, allowMapq0ForQualSum, retainOverlapMismatches, trackBaseQualityScores, null);
+    }
+
+    /**
+     * @param overlapTracker bookkeeping that lets the overlapping-fragment filter match reads up by name once
+     *                       instead of at every locus; null makes the filter work from scratch for this locus
+     */
+    public LocusReadPile(ReadBackedPileup pileup, char refBase, int minQualityScore, int minQSumQualityScore, boolean allowMapq0ForQualSum, boolean retainOverlapMismatches, boolean trackBaseQualityScores, OverlappingFragmentTracker overlapTracker) {
         this.qualitySums = new QualitySums(trackBaseQualityScores);
         this.pileup = pileup;
         this.refBase = refBase;
         this.minQSumQualityScore = minQSumQualityScore;
         this.minQualityScore = minQualityScore;
 
-        if (!retainOverlapMismatches) {
-            noOverlapPileup = getOverlappingFragmentFilteredPileup(pileup, (byte) refBase);
-        } else {
-            noOverlapPileup = getOverlappingFragmentFilteredPileupButPreferMismatches(pileup, (byte) refBase);
-        }
+        noOverlapPileup = getOverlappingFragmentFilteredPileup(pileup, (byte) refBase, retainOverlapMismatches, overlapTracker);
         this.initialPileup = noOverlapPileup.getPileupWithoutDeletions();
         this.qualityScoreFilteredPileup = initialPileup.getBaseFilteredPileup(minQualityScore);
         this.finalPileup = qualityScoreFilteredPileup.getPileupWithoutMappingQualityZeroReads();
@@ -210,7 +214,25 @@ public class LocusReadPile {
     }
 
     public static ReadBackedPileup getOverlappingFragmentFilteredPileup(ReadBackedPileup rbp, byte ref, boolean retainMismatches) {
-        Map<String,Integer> filteredPileup = new HashMap<String, Integer>();
+        return getOverlappingFragmentFilteredPileup(rbp, ref, retainMismatches, null);
+    }
+
+    /**
+     * Keeps one element per fragment.  Elements are visited in pileup order; the first element of a read name
+     * is kept, and each later element of the same name is compared with the one currently kept: if the bases
+     * disagree, both go (or, when retainMismatches, the non-reference one stays); if they agree, the higher
+     * quality one stays.
+     *
+     * With a tracker, reads are matched up by name once, the first time they are seen, instead of through a
+     * fresh name-keyed map at every locus.  The comparisons, their order and the result are the same.
+     */
+    public static ReadBackedPileup getOverlappingFragmentFilteredPileup(ReadBackedPileup rbp, byte ref, boolean retainMismatches, OverlappingFragmentTracker tracker) {
+        final Map<String,Integer> indexByName = (tracker == null) ? new HashMap<String, Integer>() : null;
+        long locusSerial = 0;
+        if (tracker != null) {
+            tracker.startLocus(rbp.getLocation());
+            locusSerial = tracker.currentLocusSerial();
+        }
 
         PileupElement[] listOfElements = new PileupElement[rbp.getNumberOfElements()];
         boolean[] elementsToKeep = new boolean[rbp.getNumberOfElements()];
@@ -221,39 +243,67 @@ public class LocusReadPile {
             if (base == 'N' || base == 'n') { continue; }
 
             listOfElements[i] = p;
-            String readName = p.getRead().getReadName();
+
+            // the element currently kept for this read's name at this locus, or -1 if there is none
+            int existingIndex = -1;
+            OverlappingFragmentTracker.Group group = null;
+            String readName = null;
+            if (tracker != null) {
+                group = tracker.groupFor(p.getRead());
+                if (group.locusSerial != locusSerial) {
+                    group.locusSerial = locusSerial;
+                    group.hasWinner = false;
+                }
+                if (group.hasWinner) { existingIndex = group.winnerIndex; }
+            } else {
+                readName = p.getRead().getReadName();
+                final Integer existingIndexOrNull = indexByName.get(readName);
+                if (existingIndexOrNull != null) { existingIndex = existingIndexOrNull; }
+            }
+
+            // the element kept for this name after looking at this one (-1: none)
+            int winnerIndex = existingIndex;
 
             // if we've never seen this read before, life is good
-            final Integer existingIndexOrNull = filteredPileup.get(readName);
-            if (existingIndexOrNull == null) {
-                filteredPileup.put(readName, i);
+            if (existingIndex == -1) {
                 elementsToKeep[i] = true;
+                winnerIndex = i;
             } else {
-                int existingIndex = existingIndexOrNull;
                 PileupElement existing = listOfElements[existingIndex];
 
                 // if the reads disagree at this position...
                 if (existing.getBase() != p.getBase()) {
                     //... and we're not retaining mismatches, throw them both out
                     if (!retainMismatches) {
-                        filteredPileup.remove(readName);
                         elementsToKeep[existingIndex] = false;
+                        winnerIndex = -1;
 
                     //... and we are retaining mismatches, keep the mismatching one
                     } else {
                         if (p.getBase() != ref) {
                             elementsToKeep[existingIndex] = false;
-                            filteredPileup.put(readName, i);
                             elementsToKeep[i] = true;
+                            winnerIndex = i;
                         }
                     }
                 // Otherwise, keep the element with the higher quality score
                 } else {
                     if (existing.getQual() < p.getQual()) {
                         elementsToKeep[existingIndex] = false;
-                        filteredPileup.put(readName, i);
                         elementsToKeep[i] = true;
+                        winnerIndex = i;
                     }
+                }
+            }
+
+            if (winnerIndex != existingIndex) {
+                if (group != null) {
+                    group.hasWinner = (winnerIndex != -1);
+                    group.winnerIndex = winnerIndex;
+                } else if (winnerIndex == -1) {
+                    indexByName.remove(readName);
+                } else {
+                    indexByName.put(readName, winnerIndex);
                 }
             }
             i++;

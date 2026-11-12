@@ -190,6 +190,10 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
     private String tumorPileupSample = null;
     private String normalPileupSample = null;
 
+    // cross-locus bookkeeping for the overlapping-fragment filter, one per kind of pile
+    private final OverlappingFragmentTracker tumorOverlapTracker = new OverlappingFragmentTracker();
+    private final OverlappingFragmentTracker normalOverlapTracker = new OverlappingFragmentTracker();
+
     private CallStatsGenerator callStatsGenerator;
 
     @Override
@@ -368,8 +372,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
 
-            final LocusReadPile tumorReadPile =  new LocusReadPile(pileupMap.get(SampleType.TUMOR), upRef, MTAC.MIN_QSCORE, MIN_QSUM_QSCORE, false, MTAC.ARTIFACT_DETECTION_MODE, MTAC.ENABLE_QSCORE_OUTPUT);
-            final LocusReadPile normalReadPile = new LocusReadPile(pileupMap.get(SampleType.NORMAL), upRef, MTAC.MIN_QSCORE, 0, this.USE_MAPQ0_IN_NORMAL_QSCORE, true, MTAC.ENABLE_QSCORE_OUTPUT);
+            final LocusReadPile tumorReadPile =  new LocusReadPile(pileupMap.get(SampleType.TUMOR), upRef, MTAC.MIN_QSCORE, MIN_QSUM_QSCORE, false, MTAC.ARTIFACT_DETECTION_MODE, MTAC.ENABLE_QSCORE_OUTPUT, tumorOverlapTracker);
+            final LocusReadPile normalReadPile = new LocusReadPile(pileupMap.get(SampleType.NORMAL), upRef, MTAC.MIN_QSCORE, 0, this.USE_MAPQ0_IN_NORMAL_QSCORE, true, MTAC.ENABLE_QSCORE_OUTPUT, normalOverlapTracker);
 
             Collection<VariantContext> panelOfNormalsVC = tracker.getValues(normalPanelRod, rawContext.getLocation());
             Collection<VariantContext> cosmicVC = tracker.getValues(cosmicRod, rawContext.getLocation());
