@@ -50,6 +50,7 @@
 package org.broadinstitute.cga.tools.gatk.walkers.cancer.mutect;
 
 import net.sf.picard.reference.IndexedFastaSequenceFile;
+import net.sf.samtools.SAMReadGroupRecord;
 import net.sf.samtools.SAMRecord;
 import org.apache.commons.lang.math.NumberUtils;
 import org.broadinstitute.cga.tools.gatk.utils.CGAAlignmentUtils;
@@ -183,6 +184,12 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
     private Set<SAMReaderID> tumorSAMReaderIDs = new HashSet<SAMReaderID>();
     private Set<SAMReaderID> normalSAMReaderIDs = new HashSet<SAMReaderID>();
 
+    // when the tumor BAMs hold one sample and the normal BAMs another, the engine's per-sample grouping of the
+    // pileup is used directly instead of merging the whole pileup and re-splitting it by read source at every locus
+    private boolean splitPileupBySample = false;
+    private String tumorPileupSample = null;
+    private String normalPileupSample = null;
+
     private CallStatsGenerator callStatsGenerator;
 
     @Override
@@ -209,6 +216,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         callStatsGenerator = new CallStatsGenerator(MTAC.ENABLE_QSCORE_OUTPUT);
 
         // check that we have at least one tumor bam
+        final Set<String> tumorSampleNames = new HashSet<String>();
+        final Set<String> normalSampleNames = new HashSet<String>();
         for(SAMReaderID id : getToolkit().getReadsDataSource().getReaderIDs()) {
             if (id.getTags().getPositionalTags().size() == 0) {
                 throw new RuntimeException("BAMs must be tagged as either 'tumor' or 'normal'");
@@ -218,6 +227,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 if (BAM_TAG_TUMOR.equalsIgnoreCase(tag)) {
                     hasTumorBam = true;
                     tumorSAMReaderIDs.add(id);
+                    tumorSampleNames.addAll(getSampleNames(id));
 
                     // fill in the sample name if necessary
                     if (MTAC.TUMOR_SAMPLE_NAME == null) {
@@ -233,6 +243,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 } else if (BAM_TAG_NORMAL.equalsIgnoreCase(tag)) {
                     hasNormalBam = true;
                     normalSAMReaderIDs.add(id);
+                    normalSampleNames.addAll(getSampleNames(id));
 
 
                     // fill in the sample name if necessary
@@ -255,6 +266,20 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
         if (!hasTumorBam) {
             throw new RuntimeException("At least one BAM tagged as 'tumor' required");
+        }
+
+        // splitting the pileup by sample name is equivalent to splitting it by BAM only when there is one sample
+        // on each side, no sample on both sides, and no restriction to some other tumor sample
+        if (tumorSampleNames.size() == 1 && !tumorSampleNames.contains(null) &&
+                normalSampleNames.size() == (hasNormalBam ? 1 : 0) && !normalSampleNames.contains(null) &&
+                Collections.disjoint(tumorSampleNames, normalSampleNames)) {
+            final String tumorSample = tumorSampleNames.iterator().next();
+            if (MTAC.BAM_TUMOR_SAMPLE_NAME == null || MTAC.BAM_TUMOR_SAMPLE_NAME.equals(tumorSample)) {
+                splitPileupBySample = true;
+                tumorPileupSample = tumorSample;
+                normalPileupSample = hasNormalBam ? normalSampleNames.iterator().next() : null;
+                logger.info("Pileups will be split by sample name: tumor=" + tumorPileupSample + " normal=" + normalPileupSample);
+            }
         }
 
         if (!hasNormalBam) {
@@ -761,8 +786,38 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
     }
 
 
+    // the sample names in the read groups of one BAM (empty if they cannot be determined)
+    private Set<String> getSampleNames(SAMReaderID id) {
+        final Set<String> names = new HashSet<String>();
+        try {
+            for (SAMReadGroupRecord rg : getToolkit().getReadsDataSource().getHeader(id).getReadGroups()) {
+                names.add(rg.getSample());
+            }
+        } catch (NullPointerException npe) {
+            // no header available; the pileup is split by read source instead
+        }
+        return names;
+    }
+
     protected Map<SampleType, ReadBackedPileup> getPileupsBySampleType(ReadBackedPileup pileup) {
         Map<SampleType, ReadBackedPileup> result = new HashMap<SampleType, ReadBackedPileup>();
+
+        if (splitPileupBySample) {
+            // the engine keeps the pileup grouped by sample, so each side's elements are fetched directly.  A merge
+            // preserves the order within each sample, so these are the same elements in the same order as the
+            // read-source split below produces.  Bases called as N are dropped by LocusReadPile instead of here.
+            final ReadBackedPileup tumorPileup = pileup.getPileupForSample(tumorPileupSample);
+            final ReadBackedPileup normalPileup = (normalPileupSample == null) ? null : pileup.getPileupForSample(normalPileupSample);
+            final int tumorSize = (tumorPileup == null) ? 0 : tumorPileup.getNumberOfElements();
+            final int normalSize = (normalPileup == null) ? 0 : normalPileup.getNumberOfElements();
+
+            // only when the two samples account for every element; otherwise fall through to the read-source split
+            if (tumorSize + normalSize == pileup.getNumberOfElements()) {
+                result.put(SampleType.TUMOR, (tumorPileup != null) ? tumorPileup : new ReadBackedPileupImpl(pileup.getLocation(), new ArrayList<PileupElement>()));
+                result.put(SampleType.NORMAL, (normalPileup != null) ? normalPileup : new ReadBackedPileupImpl(pileup.getLocation(), new ArrayList<PileupElement>()));
+                return result;
+            }
+        }
 
         ArrayList<PileupElement> tumorPileupElements = new ArrayList<PileupElement>();
         ArrayList<PileupElement> normalPileupElements = new ArrayList<PileupElement>();

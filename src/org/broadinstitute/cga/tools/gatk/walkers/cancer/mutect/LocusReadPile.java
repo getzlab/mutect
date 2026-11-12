@@ -141,16 +141,32 @@ public class LocusReadPile {
 
     public ReadBackedPileup getFinalPileupPositiveStrand() {
         if (finalPileupPositiveStrand == null) {
-            finalPileupPositiveStrand = getStrandIndependentFilteredPileup(pileup, minQualityScore).getPositiveStrandPileup();
+            finalPileupPositiveStrand = getStrandIndependentFilteredPileup(getPileupWithoutN(), minQualityScore).getPositiveStrandPileup();
         }
         return finalPileupPositiveStrand;
     }
 
     public ReadBackedPileup getFinalPileupNegativeStrand() {
         if (finalPileupNegativeStrand == null) {
-            finalPileupNegativeStrand = getStrandIndependentFilteredPileup(pileup, minQualityScore).getNegativeStrandPileup();
+            finalPileupNegativeStrand = getStrandIndependentFilteredPileup(getPileupWithoutN(), minQualityScore).getNegativeStrandPileup();
         }
         return finalPileupNegativeStrand;
+    }
+
+    // the pileup this pile was built from with the N bases removed, as the overlap filter removes them; only
+    // needed for the strand-specific pileups, so it is built on first use
+    private ReadBackedPileup pileupWithoutN;
+
+    private ReadBackedPileup getPileupWithoutN() {
+        if (pileupWithoutN == null) {
+            final List<PileupElement> kept = new ArrayList<PileupElement>(pileup.getNumberOfElements());
+            for (PileupElement p : pileup) {
+                final byte base = p.getBase();
+                if (base != 'N' && base != 'n') { kept.add(p); }
+            }
+            pileupWithoutN = new ReadBackedPileupImpl(pileup.getLocation(), kept);
+        }
+        return pileupWithoutN;
     }
 
     // calculate how many deletions are at this site and how many gap events are within GAP_EVENT_PROXIMITY bp
@@ -200,6 +216,10 @@ public class LocusReadPile {
         boolean[] elementsToKeep = new boolean[rbp.getNumberOfElements()];
         int i=0;
         for ( PileupElement p : rbp ) {
+            // bases called as N take no part in the pile (MuTect used to drop them before building it)
+            final byte base = p.getBase();
+            if (base == 'N' || base == 'n') { continue; }
+
             listOfElements[i] = p;
             String readName = p.getRead().getReadName();
 
@@ -240,7 +260,7 @@ public class LocusReadPile {
         }
 
         List<PileupElement> sortedList = new ArrayList<PileupElement>(rbp.getNumberOfElements());
-        for(int j=0; j<elementsToKeep.length; j++) {
+        for(int j=0; j<i; j++) {
             if (elementsToKeep[j]) { sortedList.add(listOfElements[j]); }
         }
 
