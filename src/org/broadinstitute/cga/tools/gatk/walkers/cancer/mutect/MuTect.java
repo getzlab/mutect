@@ -741,6 +741,15 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         return 0;
     }
 
+    @Override
+    public void onTraversalDone(Integer result) {
+        // the wiggle writers buffer their output; write what is still buffered before GATK closes the streams
+        for (CoverageWiggleFileWriter writer : new CoverageWiggleFileWriter[]{stdCovWriter, q20CovWriter, powerWriter, tumorDepthWriter, normalDepthWriter}) {
+            if (writer != null) { writer.flush(); }
+        }
+        super.onTraversalDone(result);
+    }
+
     // Given result of map function
     @Override
     public Integer reduceInit() {
