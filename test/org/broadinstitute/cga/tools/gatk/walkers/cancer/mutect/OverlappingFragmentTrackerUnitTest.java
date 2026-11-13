@@ -8,114 +8,170 @@ import org.testng.Assert;
 import org.testng.annotations.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class OverlappingFragmentTrackerUnitTest {
+    // what the tracker may hold beyond the reads of the pile: reads it has not got round to forgetting
+    private static final int SLACK = 64;
+
     private final SAMFileHeader header = ArtificialSAMUtils.createArtificialSamHeader(2, 1, 100000);
     private final GenomeLocParser genomeLocParser = new GenomeLocParser(header.getSequenceDictionary());
 
-    private GATKSAMRecord read(final String name, final int contigIndex, final int start, final int length) {
-        return ArtificialSAMUtils.createArtificialRead(header, name, contigIndex, start, length);
+    private GATKSAMRecord read(final String name, final int start, final int length) {
+        return ArtificialSAMUtils.createArtificialRead(header, name, 0, start, length);
     }
 
-    // visits a locus the way the overlapping-fragment filter does, with the reads that cover it
-    private int visit(final OverlappingFragmentTracker tracker, final String contig, final int position, final List<GATKSAMRecord> reads) {
-        tracker.startLocus(genomeLocParser.createGenomeLoc(contig, position));
-        int covering = 0;
-        for (final GATKSAMRecord read : reads) {
-            if (read.getAlignmentStart() <= position && position <= read.getAlignmentEnd()) {
-                tracker.groupFor(read);
-                covering++;
-            }
+    private List<GATKSAMRecord> reads(final String namePrefix, final int count) {
+        final List<GATKSAMRecord> reads = new ArrayList<GATKSAMRecord>();
+        for (int i = 0; i < count; i++) {
+            reads.add(read(namePrefix + i, 1, 50));
         }
-        return covering;
+        return reads;
+    }
+
+    // visits a locus the way the overlapping-fragment filter does, with the reads of its pile
+    private void visit(final OverlappingFragmentTracker tracker, final String contig, final int position, final List<GATKSAMRecord> pile) {
+        tracker.startLocus(genomeLocParser.createGenomeLoc(contig, position));
+        for (final GATKSAMRecord read : pile) {
+            tracker.groupFor(read);
+        }
     }
 
     /**
-     * The tracker must not hold on to reads that have ended: at every locus it knows exactly the reads that
-     * cover the locus, no matter how deep the pile is or how long the traversal has been going.
+     * Walks a deep pile in which every read stays for as many loci as the engine keeps it, and checks at each
+     * locus that the tracker holds little more than the pile: the reads of the pile, those that left the pile
+     * at this very locus, and its allowance of reads it has yet to forget.
      */
-    @Test
-    public void holdsOnlyTheReadsCoveringTheLocus() {
-        final int readLength = 50;
-        final int readsStartingPerPosition = 20;
+    private void checkTrackerStaysCloseToThePile(final int lociAReadStays, final int readsStartingPerPosition, final int minimumDepth) {
         final int lastStart = 2000;
-
-        final List<GATKSAMRecord> reads = new ArrayList<GATKSAMRecord>();
-        for (int start = 1; start <= lastStart; start++) {
+        final List<List<GATKSAMRecord>> readsStartingAt = new ArrayList<List<GATKSAMRecord>>();
+        for (int start = 0; start <= lastStart; start++) {
+            final List<GATKSAMRecord> starting = new ArrayList<GATKSAMRecord>();
             for (int i = 0; i < readsStartingPerPosition; i++) {
-                // a few shorter reads, so that reads do not end in the order they start
-                final int length = (i % 5 == 0) ? readLength - 17 : readLength;
-                reads.add(read("read" + start + "_" + i, 0, start, length));
+                starting.add(read("read" + start + "_" + i, start + 1, 50));
             }
+            readsStartingAt.add(starting);
         }
 
         final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
         int deepest = 0;
-        for (int position = 1; position <= lastStart + readLength; position++) {
-            // only hand the tracker the reads near this position, as a pileup would
-            final int from = Math.max(0, (position - readLength) * readsStartingPerPosition);
-            final int to = Math.min(reads.size(), position * readsStartingPerPosition);
-            final int covering = visit(tracker, "chr1", position, reads.subList(from, to));
-            Assert.assertEquals(tracker.openReadCount(), covering, "reads held at position " + position);
-            deepest = Math.max(deepest, covering);
+        int previousPileSize = 0;
+        for (int position = 0; position <= lastStart; position++) {
+            final List<GATKSAMRecord> pile = new ArrayList<GATKSAMRecord>();
+            for (int start = Math.max(0, position - lociAReadStays + 1); start <= position; start++) {
+                final List<GATKSAMRecord> starting = readsStartingAt.get(start);
+                // some reads leave a few loci early, so that reads do not leave in the order they came
+                final int staying = (position - start >= lociAReadStays - 7) ? starting.size() * 4 / 5 : starting.size();
+                pile.addAll(starting.subList(0, staying));
+            }
+            visit(tracker, "chr1", position + 1, pile);
+
+            final int allowed = pile.size() + readsStartingPerPosition + SLACK + previousPileSize / 8;
+            Assert.assertTrue(tracker.trackedReadCount() <= allowed,
+                    "at position " + position + " the pile has " + pile.size() + " reads and the tracker holds " + tracker.trackedReadCount());
+            Assert.assertTrue(tracker.trackedReadCount() >= pile.size());
+            deepest = Math.max(deepest, pile.size());
+            previousPileSize = pile.size();
         }
-        Assert.assertTrue(deepest >= 900, "the test pile should be deep, was " + deepest);
+        Assert.assertTrue(deepest >= minimumDepth, "the test pile should be deep, was " + deepest);
     }
 
     @Test
-    public void forgetsReadsAcrossAGapAndOnANewContig() {
-        final List<GATKSAMRecord> reads = new ArrayList<GATKSAMRecord>();
-        reads.add(read("a", 0, 100, 50));
-        reads.add(read("b", 0, 120, 50));
-        reads.add(read("c", 0, 5000, 50));
-        reads.add(read("d", 1, 5000, 50));
+    public void holdsLittleMoreThanThePileWhenReadsRunToTheirEnd() {
+        checkTrackerStaysCloseToThePile(50, 20, 900);
+    }
 
-        final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
-        final List<GATKSAMRecord> onChr1 = reads.subList(0, 3);
-        Assert.assertEquals(visit(tracker, "chr1", 130, onChr1), 2);
-        Assert.assertEquals(tracker.openReadCount(), 2);
-
-        // the traversal skips positions without coverage (and the gaps between intervals)
-        Assert.assertEquals(visit(tracker, "chr1", 5010, onChr1), 1);
-        Assert.assertEquals(tracker.openReadCount(), 1);
-
-        Assert.assertEquals(visit(tracker, "chr2", 5010, reads.subList(3, 4)), 1);
-        Assert.assertEquals(tracker.openReadCount(), 1);
+    /**
+     * Where coverage is above the downsampling target the engine drops most reads long before they end.
+     * The tracker must let go of them then, not when the traversal reaches their end.
+     */
+    @Test
+    public void holdsLittleMoreThanThePileWhenTheEngineDropsReadsEarly() {
+        checkTrackerStaysCloseToThePile(8, 120, 700);
     }
 
     @Test
-    public void readsSharingANameShareAGroupWhileTheyAreOpen() {
-        final GATKSAMRecord first = read("pair", 0, 100, 50);    // covers 100-149
-        final GATKSAMRecord mate = read("pair", 0, 130, 50);     // covers 130-179
-        final GATKSAMRecord other = read("other", 0, 130, 50);
-        final GATKSAMRecord sameNameLater = read("pair", 0, 300, 50);
+    public void forgetsEverythingOnANewContig() {
+        final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
+        visit(tracker, "chr1", 130, reads("a", 500));
+        Assert.assertEquals(tracker.trackedReadCount(), 500);
+
+        final GATKSAMRecord onChr2 = ArtificialSAMUtils.createArtificialRead(header, "b", 1, 130, 50);
+        visit(tracker, "chr2", 130, Arrays.asList(onChr2));
+        Assert.assertEquals(tracker.trackedReadCount(), 1);
+    }
+
+    @Test
+    public void readsSharingANameShareAGroup() {
+        final GATKSAMRecord first = read("pair", 100, 50);
+        final GATKSAMRecord mate = read("pair", 130, 50);
+        final GATKSAMRecord other = read("other", 130, 50);
 
         final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
-
         tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 140));
         final OverlappingFragmentTracker.Group group = tracker.groupFor(first);
         Assert.assertSame(tracker.groupFor(mate), group);
-        Assert.assertSame(tracker.groupFor(first), group);
         Assert.assertNotSame(tracker.groupFor(other), group);
         Assert.assertEquals(group.members, 2);
 
-        // a read is still known at its last base ...
-        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 149));
-        Assert.assertSame(tracker.groupFor(first), group);
-        Assert.assertEquals(tracker.openReadCount(), 3);
-
-        // ... and forgotten right after it, while its mate keeps the group
-        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 150));
-        Assert.assertEquals(tracker.openReadCount(), 2);
+        // the same groups at the next locus
+        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 141));
         Assert.assertSame(tracker.groupFor(mate), group);
-        Assert.assertEquals(group.members, 1);
+        Assert.assertSame(tracker.groupFor(first), group);
+        Assert.assertEquals(group.members, 2);
+    }
 
-        // once every read of the name has ended, the name starts afresh
-        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 310));
-        Assert.assertEquals(tracker.openReadCount(), 0);
-        final OverlappingFragmentTracker.Group later = tracker.groupFor(sameNameLater);
-        Assert.assertNotSame(later, group);
-        Assert.assertEquals(later.members, 1);
+    /**
+     * A read can be missing from the pile at a locus and come back (its base there is an N, or the locus is in
+     * a skipped region of the read).  If it was forgotten in between, it must find its mate's group again.
+     */
+    @Test
+    public void aForgottenReadThatComesBackRejoinsItsMate() {
+        final GATKSAMRecord first = read("pair", 100, 50);
+        final GATKSAMRecord mate = read("pair", 130, 50);
+
+        final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
+
+        final List<GATKSAMRecord> pile = reads("filler", 200);
+        pile.add(first);
+        pile.add(mate);
+        visit(tracker, "chr1", 140, pile);
+        Assert.assertEquals(tracker.trackedReadCount(), 202);
+
+        // only the mate is in the next pile; at the locus after, everything else has been forgotten
+        visit(tracker, "chr1", 141, Arrays.asList(mate));
+        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 142));
+        Assert.assertEquals(tracker.trackedReadCount(), 1);
+
+        final OverlappingFragmentTracker.Group mateGroup = tracker.groupFor(mate);
+        Assert.assertEquals(mateGroup.members, 1);
+        Assert.assertSame(tracker.groupFor(first), mateGroup);
+        Assert.assertEquals(mateGroup.members, 2);
+    }
+
+    @Test
+    public void aNameStartsAfreshOnceAllItsReadsAreForgotten() {
+        final GATKSAMRecord first = read("pair", 100, 50);
+        final GATKSAMRecord mate = read("pair", 130, 50);
+
+        final OverlappingFragmentTracker tracker = new OverlappingFragmentTracker();
+
+        final List<GATKSAMRecord> pile = reads("filler", 200);
+        pile.add(first);
+        pile.add(mate);
+        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 140));
+        for (final GATKSAMRecord read : pile) { tracker.groupFor(read); }
+        final OverlappingFragmentTracker.Group oldGroup = tracker.groupFor(first);
+
+        // neither read of the pair is in the next pile
+        visit(tracker, "chr1", 141, reads("another", 1));
+        tracker.startLocus(genomeLocParser.createGenomeLoc("chr1", 142));
+        Assert.assertEquals(tracker.trackedReadCount(), 1);
+
+        final OverlappingFragmentTracker.Group newGroup = tracker.groupFor(mate);
+        Assert.assertNotSame(newGroup, oldGroup);
+        Assert.assertSame(tracker.groupFor(first), newGroup);
+        Assert.assertEquals(newGroup.members, 2);
     }
 }

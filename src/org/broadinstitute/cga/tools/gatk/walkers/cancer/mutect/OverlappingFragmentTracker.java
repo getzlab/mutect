@@ -52,32 +52,33 @@ package org.broadinstitute.cga.tools.gatk.walkers.cancer.mutect;
 import org.broadinstitute.sting.utils.GenomeLoc;
 import org.broadinstitute.sting.utils.sam.GATKSAMRecord;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
-import java.util.List;
+import java.util.Iterator;
 import java.util.Map;
-import java.util.TreeMap;
 
 /**
  * Bookkeeping for the overlapping-fragment filter that avoids hashing every read name at every locus.
  *
  * The engine presents the same read object at every locus the read covers, so each read is looked up by name
- * once, when it is first seen, and linked to the group of open reads that share its name (normally just its
+ * once, when it is first seen, and linked to the group of tracked reads that share its name (normally just its
  * mate).  At a locus, the reads of a group go through the same sequential comparison the per-locus version of
  * the filter applies, in the same pileup order, so the result is identical.
  *
- * A read is forgotten at the first locus past its end, so the tracker never holds a read longer than the
- * traversal itself does.  (Holding reads for longer keeps their bases and qualities in memory; where the
- * coverage is extreme that is hundreds of thousands of reads.)
+ * Reads are forgotten soon after they stop turning up in the pile, whether they have ended or the engine has
+ * dropped them early (where coverage is above the downsampling target it replaces most reads long before they
+ * end): the tracker never holds more than the reads of the last pile plus an eighth.  Holding reads for longer
+ * keeps their bases and qualities in memory, hundreds of thousands of reads where the coverage is extreme.
+ * A read that turns up again after being forgotten (it can be missing from the pile at a locus where its base
+ * is an N, or inside a skipped region) is simply looked up by name again, so when a read is forgotten never
+ * changes the result.
  *
  * A tracker belongs to one kind of pile (tumor or normal), since names are only compared within a kind, and it
- * must be used for exactly one filter call per locus, with loci visited in increasing position order within a
- * contig, as the traversal does.  Not thread safe.
+ * must be used for exactly one filter call per locus.  Not thread safe.
  */
 final class OverlappingFragmentTracker {
 
-    /** The open reads sharing one name, plus the state of the comparison among them at the current locus */
+    /** The tracked reads sharing one name, plus the state of the comparison among them at the current locus */
     static final class Group {
         int members = 0;
 
@@ -87,31 +88,42 @@ final class OverlappingFragmentTracker {
         int winnerIndex = -1;
     }
 
-    private final Map<GATKSAMRecord, Group> groupByRead = new IdentityHashMap<GATKSAMRecord, Group>();
-    private final Map<String, Group> groupByName = new HashMap<String, Group>();
+    /** A tracked read's group, and the last locus at which the read was in the pile */
+    private static final class TrackedRead {
+        final Group group;
+        long lastSeenAtLocus;
 
-    // the open reads filed under their alignment end, so those that have ended are found without a search.
-    // There is one entry per distinct end among the open reads, i.e. about as many as a read is long.
-    private final TreeMap<Integer, List<GATKSAMRecord>> readsByEnd = new TreeMap<Integer, List<GATKSAMRecord>>();
+        TrackedRead(final Group group) { this.group = group; }
+    }
+
+    // reads that were not in the last pile are tolerated up to this many plus an eighth of that pile
+    private static final int UNSEEN_READS_ALLOWED = 64;
+
+    private final Map<GATKSAMRecord, TrackedRead> trackedReads = new IdentityHashMap<GATKSAMRecord, TrackedRead>();
+    private final Map<String, Group> groupByName = new HashMap<String, Group>();
 
     private long locusSerial = 0;
     private int contigIndex = -1;
+    private int readsSeenAtThisLocus = 0;
 
     /**
      * Must be called once at the start of each locus, before groupFor() is called for its reads
      */
     void startLocus(final GenomeLoc locus) {
-        locusSerial++;
-
         if (locus.getContigIndex() != contigIndex) {
             // nothing from another contig can be in a pileup on this one
-            groupByRead.clear();
+            trackedReads.clear();
             groupByName.clear();
-            readsByEnd.clear();
             contigIndex = locus.getContigIndex();
         } else {
-            forgetReadsEndingBefore(locus.getStart());
+            final int unseen = trackedReads.size() - readsSeenAtThisLocus;
+            if (unseen > UNSEEN_READS_ALLOWED + readsSeenAtThisLocus / 8) {
+                forgetReadsNotSeenAt(locusSerial);
+            }
         }
+
+        locusSerial++;
+        readsSeenAtThisLocus = 0;
     }
 
     long currentLocusSerial() {
@@ -119,45 +131,42 @@ final class OverlappingFragmentTracker {
     }
 
     /**
-     * @return the group of open reads sharing this read's name, creating it (and linking the read to it) on the
-     *         read's first appearance
+     * @return the group of tracked reads sharing this read's name, creating it (and linking the read to it) on
+     *         the read's first appearance.  To be called once per locus for each read of the pile.
      */
     Group groupFor(final GATKSAMRecord read) {
-        Group group = groupByRead.get(read);
-        if (group == null) {
+        TrackedRead tracked = trackedReads.get(read);
+        if (tracked == null) {
             final String readName = read.getReadName();
-            group = groupByName.get(readName);
+            Group group = groupByName.get(readName);
             if (group == null) {
                 group = new Group();
                 groupByName.put(readName, group);
             }
             group.members++;
-            groupByRead.put(read, group);
-
-            final Integer end = read.getAlignmentEnd();
-            List<GATKSAMRecord> endingHere = readsByEnd.get(end);
-            if (endingHere == null) {
-                endingHere = new ArrayList<GATKSAMRecord>();
-                readsByEnd.put(end, endingHere);
-            }
-            endingHere.add(read);
+            tracked = new TrackedRead(group);
+            trackedReads.put(read, tracked);
         }
-        return group;
+        tracked.lastSeenAtLocus = locusSerial;
+        readsSeenAtThisLocus++;
+        return tracked.group;
     }
 
-    // forgets reads that cannot be in the pileup at this position or any later one on the same contig
-    private void forgetReadsEndingBefore(final int position) {
-        while (!readsByEnd.isEmpty() && readsByEnd.firstKey() < position) {
-            for (final GATKSAMRecord read : readsByEnd.pollFirstEntry().getValue()) {
-                final Group group = groupByRead.remove(read);
-                if (group != null && --group.members == 0) {
-                    groupByName.remove(read.getReadName());
+    private void forgetReadsNotSeenAt(final long locus) {
+        final Iterator<Map.Entry<GATKSAMRecord, TrackedRead>> entries = trackedReads.entrySet().iterator();
+        while (entries.hasNext()) {
+            final Map.Entry<GATKSAMRecord, TrackedRead> entry = entries.next();
+            final TrackedRead tracked = entry.getValue();
+            if (tracked.lastSeenAtLocus != locus) {
+                if (--tracked.group.members == 0) {
+                    groupByName.remove(entry.getKey().getReadName());
                 }
+                entries.remove();
             }
         }
     }
 
-    int openReadCount() {
-        return groupByRead.size();
+    int trackedReadCount() {
+        return trackedReads.size();
     }
 }
