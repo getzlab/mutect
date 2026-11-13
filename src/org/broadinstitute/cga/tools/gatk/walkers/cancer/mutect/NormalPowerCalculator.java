@@ -88,23 +88,19 @@ public class NormalPowerCalculator extends AbstractPowerCalculator {
         // calculate the probability of each configuration
 		// NOTE: reorder from tumor case to be # of ref instead of # of alts
         BinomialDistribution binom = new BinomialDistributionImpl(depth, eps);
-        double[] p = new double[depth+1];
-        for(int i=0; i<p.length; i++) {
-            p[i] = binom.probability(depth - i);
-        }
 
-        // calculate the LOD scores
-        double[] lod = new double[depth+1];
-        for(int i=0; i<lod.length; i++) {
-            lod[i] = calculateNormalLod(depth, depth-i, eps);
-        }
-
+        // calculate the LOD scores, up to the first that reaches the threshold (see TumorPowerCalculator)
         int k = -1;
-        for(int i=0; i<lod.length; i++) {
-            if (lod[i] >= lodThreshold) {
+        double lodAtK = 0;
+        double lodBeforeK = 0;
+        for(int i=0; i<=depth; i++) {
+            final double lod = calculateNormalLod(depth, depth-i, eps);
+            if (lod >= lodThreshold) {
                 k = i;
+                lodAtK = lod;
                 break;
             }
+            lodBeforeK = lod;
         }
 
         // if no depth meets the lod score, the power is zero
@@ -119,15 +115,12 @@ public class NormalPowerCalculator extends AbstractPowerCalculator {
         // the k and k-1 bin, so we prorate the power from that bin
         // if k==0, it must be that lodThreshold == lod[k] so we don't have to make this correction
         if ( enableSmoothing && k > 0 ) {
-            double x = 1d - (lodThreshold - lod[k-1]) / (lod[k] - lod[k-1]);
-            power = x*p[k-1];
+            double x = 1d - (lodThreshold - lodBeforeK) / (lodAtK - lodBeforeK);
+            power = x*binom.probability(depth - (k-1));
         }
 
-        for(int i=k; i<p.length; i++) {
-            power += p[i];
-        }
-
-        return(power);
+        // add the probability of each configuration from k up
+        return addProbabilities(power, binom, depth, eps, k, true);
     }
 
 }

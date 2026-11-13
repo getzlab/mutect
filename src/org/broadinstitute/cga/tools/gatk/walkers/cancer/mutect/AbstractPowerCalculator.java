@@ -49,6 +49,8 @@
 
 package org.broadinstitute.cga.tools.gatk.walkers.cancer.mutect;
 
+import org.apache.commons.math.distribution.BinomialDistribution;
+
 import java.util.HashMap;
 
 public class AbstractPowerCalculator {
@@ -93,6 +95,74 @@ public class AbstractPowerCalculator {
         double a = (depth-alts) * Math.log10(f*eps + (1d-f)*(1d-eps));
         double b = (alts) * Math.log10(f*(1d-eps) + (1d-f)*eps);
         return (a+b);
+    }
+
+    // how many probabilities in a row must be exactly zero before the rest of that tail is taken to be zero
+    private static final int ZEROS_ENDING_A_TAIL = 4;
+
+    /**
+     * Returns start + p(from) + p(from+1) + ... + p(depth), added in that order, where p(i) is the binomial
+     * probability of i successes (or of depth - i successes when reversed).
+     *
+     * The result is bit for bit what adding every term gives, but the terms that are exactly 0.0 are not
+     * computed.  Far enough from its peak a binomial probability underflows to exactly 0.0, and it keeps
+     * falling from there on (the distribution has a single peak), so each tail is cut off once a few
+     * probabilities in a row have come out as zero; adding a zero would not have changed the sum.  At a depth
+     * of 200,000 this leaves about 15,000 terms.
+     */
+    protected static double addProbabilities(final double start, final BinomialDistribution binom, final int depth,
+                                             final double successProbability, final int from, final boolean reversed) {
+        // adding the first term turns a start of -0.0 into +0.0 even when that term is zero; do the same up
+        // front, because a zero first term may be skipped below.  It changes no other value.
+        double sum = start + 0.0d;
+
+        int peak = (int) Math.floor((depth + 1) * successProbability);
+        peak = Math.max(0, Math.min(depth, peak));
+        if (reversed) { peak = depth - peak; }
+
+        final boolean hasTwoTails = successProbability > 0 && successProbability < 1;
+        if (!hasTwoTails || binom.probability(reversed ? depth - peak : peak) == 0.0d) {
+            // not the shape assumed above: add every term
+            for (int i = from; i <= depth; i++) {
+                sum += binom.probability(reversed ? depth - i : i);
+            }
+            return sum;
+        }
+
+        int next = from;
+        if (peak >= from) {
+            // from the peak down to where the lower tail vanishes (or to the first term wanted), then add upwards
+            final double[] p = new double[peak - from + 1];
+            int lowest = peak + 1;
+            int zeros = 0;
+            for (int i = peak; i >= from; i--) {
+                final double pi = binom.probability(reversed ? depth - i : i);
+                p[i - from] = pi;
+                lowest = i;
+                if (pi != 0.0d) {
+                    zeros = 0;
+                } else if (++zeros == ZEROS_ENDING_A_TAIL) {
+                    break;
+                }
+            }
+            for (int i = lowest; i <= peak; i++) {
+                sum += p[i - from];
+            }
+            next = peak + 1;
+        }
+
+        // past the peak, until the upper tail vanishes
+        int zeros = 0;
+        for (int i = next; i <= depth; i++) {
+            final double pi = binom.probability(reversed ? depth - i : i);
+            sum += pi;
+            if (pi != 0.0d) {
+                zeros = 0;
+            } else if (++zeros == ZEROS_ENDING_A_TAIL) {
+                break;
+            }
+        }
+        return sum;
     }
 
 }
