@@ -52,10 +52,12 @@ package org.broadinstitute.cga.tools.gatk.walkers.cancer.mutect;
 import org.broadinstitute.sting.utils.GenomeLoc;
 import org.broadinstitute.sting.utils.sam.GATKSAMRecord;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Bookkeeping for the overlapping-fragment filter that avoids hashing every read name at every locus.
@@ -63,8 +65,11 @@ import java.util.Map;
  * The engine presents the same read object at every locus the read covers, so each read is looked up by name
  * once, when it is first seen, and linked to the group of open reads that share its name (normally just its
  * mate).  At a locus, the reads of a group go through the same sequential comparison the per-locus version of
- * the filter applies, in the same pileup order, so the result is identical.  Reads that have ended are purged
- * periodically.
+ * the filter applies, in the same pileup order, so the result is identical.
+ *
+ * A read is forgotten at the first locus past its end, so the tracker never holds a read longer than the
+ * traversal itself does.  (Holding reads for longer keeps their bases and qualities in memory; where the
+ * coverage is extreme that is hundreds of thousands of reads.)
  *
  * A tracker belongs to one kind of pile (tumor or normal), since names are only compared within a kind, and it
  * must be used for exactly one filter call per locus, with loci visited in increasing position order within a
@@ -82,14 +87,15 @@ final class OverlappingFragmentTracker {
         int winnerIndex = -1;
     }
 
-    private static final int LOCI_BETWEEN_PURGES = 256;
-
     private final Map<GATKSAMRecord, Group> groupByRead = new IdentityHashMap<GATKSAMRecord, Group>();
     private final Map<String, Group> groupByName = new HashMap<String, Group>();
 
+    // the open reads filed under their alignment end, so those that have ended are found without a search.
+    // There is one entry per distinct end among the open reads, i.e. about as many as a read is long.
+    private final TreeMap<Integer, List<GATKSAMRecord>> readsByEnd = new TreeMap<Integer, List<GATKSAMRecord>>();
+
     private long locusSerial = 0;
     private int contigIndex = -1;
-    private int lociSincePurge = 0;
 
     /**
      * Must be called once at the start of each locus, before groupFor() is called for its reads
@@ -101,11 +107,10 @@ final class OverlappingFragmentTracker {
             // nothing from another contig can be in a pileup on this one
             groupByRead.clear();
             groupByName.clear();
+            readsByEnd.clear();
             contigIndex = locus.getContigIndex();
-            lociSincePurge = 0;
-        } else if (++lociSincePurge >= LOCI_BETWEEN_PURGES) {
-            purgeReadsEndingBefore(locus.getStart());
-            lociSincePurge = 0;
+        } else {
+            forgetReadsEndingBefore(locus.getStart());
         }
     }
 
@@ -128,22 +133,26 @@ final class OverlappingFragmentTracker {
             }
             group.members++;
             groupByRead.put(read, group);
+
+            final Integer end = read.getAlignmentEnd();
+            List<GATKSAMRecord> endingHere = readsByEnd.get(end);
+            if (endingHere == null) {
+                endingHere = new ArrayList<GATKSAMRecord>();
+                readsByEnd.put(end, endingHere);
+            }
+            endingHere.add(read);
         }
         return group;
     }
 
     // forgets reads that cannot be in the pileup at this position or any later one on the same contig
-    private void purgeReadsEndingBefore(final long position) {
-        final Iterator<Map.Entry<GATKSAMRecord, Group>> entries = groupByRead.entrySet().iterator();
-        while (entries.hasNext()) {
-            final Map.Entry<GATKSAMRecord, Group> entry = entries.next();
-            final GATKSAMRecord read = entry.getKey();
-            if (read.getAlignmentEnd() < position) {
-                final Group group = entry.getValue();
-                if (--group.members == 0) {
+    private void forgetReadsEndingBefore(final int position) {
+        while (!readsByEnd.isEmpty() && readsByEnd.firstKey() < position) {
+            for (final GATKSAMRecord read : readsByEnd.pollFirstEntry().getValue()) {
+                final Group group = groupByRead.remove(read);
+                if (group != null && --group.members == 0) {
                     groupByName.remove(read.getReadName());
                 }
-                entries.remove();
             }
         }
     }
