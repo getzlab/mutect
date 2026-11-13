@@ -71,9 +71,19 @@ public class LocusReadPile {
     protected int minQSumQualityScore;
     protected QualitySums qualitySums;
 
-    public ReadBackedPileup initialPileup;
-    protected ReadBackedPileup qualityScoreFilteredPileup;
-    public ReadBackedPileup finalPileup;
+    // the pileups derived from noOverlapPileup, built on first use since most loci only need the counts below
+    private ReadBackedPileup initialPileup;               // without deletions
+    private ReadBackedPileup qualityScoreFilteredPileup;  // ... and without bases under minQualityScore
+    private ReadBackedPileup finalPileup;                 // ... and without mapping quality zero reads
+
+    // counts over those pileups, gathered in one pass when the pile is built
+    private int qualityScoreFilteredDepth = 0;
+    private int qualityScoreFilteredMappingQualityZeroCount = 0;
+    private int finalPileupDepth = 0;
+    private int finalPileupQ20Depth = 0;
+    private final int[] finalPileupBaseCounts = new int[4];
+
+    public static final int Q20 = 20;
 
 
     // the strand-specific pileups and the gap event counts are only needed for sites that become
@@ -100,36 +110,97 @@ public class LocusReadPile {
     }
 
     public LocusReadPile(ReadBackedPileup pileup, char refBase, int minQualityScore, int minQSumQualityScore, boolean allowMapq0ForQualSum, boolean retainOverlapMismatches, boolean trackBaseQualityScores) {
+        this(pileup, refBase, minQualityScore, minQSumQualityScore, allowMapq0ForQualSum, retainOverlapMismatches, trackBaseQualityScores, null);
+    }
+
+    /**
+     * @param overlapTracker bookkeeping that lets the overlapping-fragment filter match reads up by name once
+     *                       instead of at every locus; null makes the filter work from scratch for this locus
+     */
+    public LocusReadPile(ReadBackedPileup pileup, char refBase, int minQualityScore, int minQSumQualityScore, boolean allowMapq0ForQualSum, boolean retainOverlapMismatches, boolean trackBaseQualityScores, OverlappingFragmentTracker overlapTracker) {
         this.qualitySums = new QualitySums(trackBaseQualityScores);
         this.pileup = pileup;
         this.refBase = refBase;
         this.minQSumQualityScore = minQSumQualityScore;
         this.minQualityScore = minQualityScore;
 
-        if (!retainOverlapMismatches) {
-            noOverlapPileup = getOverlappingFragmentFilteredPileup(pileup, (byte) refBase);
-        } else {
-            noOverlapPileup = getOverlappingFragmentFilteredPileupButPreferMismatches(pileup, (byte) refBase);
+        noOverlapPileup = getOverlappingFragmentFilteredPileup(pileup, (byte) refBase, retainOverlapMismatches, overlapTracker);
+
+        // one pass gathers everything a locus needs unless it becomes a candidate, applying the same filters in
+        // the same order as getInitialPileup / getQualityScoreFilteredPileup / getFinalPileup do
+        for (PileupElement p : noOverlapPileup) {
+            if (p.isDeletion()) { continue; }                                   // not in initialPileup
+
+            final byte qual = p.getQual();
+            if (qual < minQualityScore) { continue; }                          // not in qualityScoreFilteredPileup
+
+            final int mappingQual = p.getMappingQual();
+            qualityScoreFilteredDepth++;
+            if (mappingQual == 0) { qualityScoreFilteredMappingQualityZeroCount++; }
+
+            if ((mappingQual != 0 || allowMapq0ForQualSum) && qual > minQSumQualityScore) {
+                qualitySums.incrementSum((char) p.getBase(), 1, qual);
+            }
+
+            if (mappingQual > 0) {                                              // in finalPileup
+                finalPileupDepth++;
+                if (qual >= Q20) { finalPileupQ20Depth++; }
+                final int baseIndex = BaseUtils.simpleBaseToBaseIndex((char) p.getBase());
+                if (baseIndex != -1) { finalPileupBaseCounts[baseIndex]++; }
+            }
         }
-        this.initialPileup = noOverlapPileup.getPileupWithoutDeletions();
-        this.qualityScoreFilteredPileup = initialPileup.getBaseFilteredPileup(minQualityScore);
-        this.finalPileup = qualityScoreFilteredPileup.getPileupWithoutMappingQualityZeroReads();
+    }
 
-        for (PileupElement p : qualityScoreFilteredPileup) {
-            if (p.getMappingQual() == 0 && !allowMapq0ForQualSum) { continue; }
-            if (p.getQual() <= minQSumQualityScore) { continue; }
-
-            if (p.getQual() > this.minQSumQualityScore) { qualitySums.incrementSum((char)p.getBase(), 1, p.getQual()); }
- 
+    /** the overlap-filtered pileup without deletions */
+    public ReadBackedPileup getInitialPileup() {
+        if (initialPileup == null) {
+            initialPileup = noOverlapPileup.getPileupWithoutDeletions();
         }
+        return initialPileup;
+    }
 
+    /** the initial pileup without bases under the minimum quality score */
+    public ReadBackedPileup getQualityScoreFilteredPileup() {
+        if (qualityScoreFilteredPileup == null) {
+            qualityScoreFilteredPileup = getInitialPileup().getBaseFilteredPileup(minQualityScore);
+        }
+        return qualityScoreFilteredPileup;
+    }
+
+    /** the quality score filtered pileup without mapping quality zero reads */
+    public ReadBackedPileup getFinalPileup() {
+        if (finalPileup == null) {
+            finalPileup = getQualityScoreFilteredPileup().getPileupWithoutMappingQualityZeroReads();
+        }
+        return finalPileup;
     }
 
     /**
      * @return the number of reads in the final pileup
      */
     public int getFinalPileupDepth() {
-        return finalPileup.getNumberOfElements();
+        return finalPileupDepth;
+    }
+
+    /**
+     * @return the number of reads in the final pileup with base quality of at least 20
+     */
+    public int getFinalPileupQ20Depth() {
+        return finalPileupQ20Depth;
+    }
+
+    /**
+     * @return the number of reads in the quality score filtered pileup
+     */
+    public int getQualityScoreFilteredDepth() {
+        return qualityScoreFilteredDepth;
+    }
+
+    /**
+     * @return the number of mapping quality zero reads in the quality score filtered pileup
+     */
+    public int getQualityScoreFilteredMappingQualityZeroCount() {
+        return qualityScoreFilteredMappingQualityZeroCount;
     }
 
     /**
@@ -141,16 +212,32 @@ public class LocusReadPile {
 
     public ReadBackedPileup getFinalPileupPositiveStrand() {
         if (finalPileupPositiveStrand == null) {
-            finalPileupPositiveStrand = getStrandIndependentFilteredPileup(pileup, minQualityScore).getPositiveStrandPileup();
+            finalPileupPositiveStrand = getStrandIndependentFilteredPileup(getPileupWithoutN(), minQualityScore).getPositiveStrandPileup();
         }
         return finalPileupPositiveStrand;
     }
 
     public ReadBackedPileup getFinalPileupNegativeStrand() {
         if (finalPileupNegativeStrand == null) {
-            finalPileupNegativeStrand = getStrandIndependentFilteredPileup(pileup, minQualityScore).getNegativeStrandPileup();
+            finalPileupNegativeStrand = getStrandIndependentFilteredPileup(getPileupWithoutN(), minQualityScore).getNegativeStrandPileup();
         }
         return finalPileupNegativeStrand;
+    }
+
+    // the pileup this pile was built from with the N bases removed, as the overlap filter removes them; only
+    // needed for the strand-specific pileups, so it is built on first use
+    private ReadBackedPileup pileupWithoutN;
+
+    private ReadBackedPileup getPileupWithoutN() {
+        if (pileupWithoutN == null) {
+            final List<PileupElement> kept = new ArrayList<PileupElement>(pileup.getNumberOfElements());
+            for (PileupElement p : pileup) {
+                final byte base = p.getBase();
+                if (base != 'N' && base != 'n') { kept.add(p); }
+            }
+            pileupWithoutN = new ReadBackedPileupImpl(pileup.getLocation(), kept);
+        }
+        return pileupWithoutN;
     }
 
     // calculate how many deletions are at this site and how many gap events are within GAP_EVENT_PROXIMITY bp
@@ -194,53 +281,103 @@ public class LocusReadPile {
     }
 
     public static ReadBackedPileup getOverlappingFragmentFilteredPileup(ReadBackedPileup rbp, byte ref, boolean retainMismatches) {
-        Map<String,Integer> filteredPileup = new HashMap<String, Integer>();
+        return getOverlappingFragmentFilteredPileup(rbp, ref, retainMismatches, null);
+    }
+
+    /**
+     * Keeps one element per fragment.  Elements are visited in pileup order; the first element of a read name
+     * is kept, and each later element of the same name is compared with the one currently kept: if the bases
+     * disagree, both go (or, when retainMismatches, the non-reference one stays); if they agree, the higher
+     * quality one stays.
+     *
+     * With a tracker, reads are matched up by name once, the first time they are seen, instead of through a
+     * fresh name-keyed map at every locus.  The comparisons, their order and the result are the same.
+     */
+    public static ReadBackedPileup getOverlappingFragmentFilteredPileup(ReadBackedPileup rbp, byte ref, boolean retainMismatches, OverlappingFragmentTracker tracker) {
+        final Map<String,Integer> indexByName = (tracker == null) ? new HashMap<String, Integer>() : null;
+        long locusSerial = 0;
+        if (tracker != null) {
+            tracker.startLocus(rbp.getLocation());
+            locusSerial = tracker.currentLocusSerial();
+        }
 
         PileupElement[] listOfElements = new PileupElement[rbp.getNumberOfElements()];
         boolean[] elementsToKeep = new boolean[rbp.getNumberOfElements()];
         int i=0;
         for ( PileupElement p : rbp ) {
+            // bases called as N take no part in the pile (MuTect used to drop them before building it)
+            final byte base = p.getBase();
+            if (base == 'N' || base == 'n') { continue; }
+
             listOfElements[i] = p;
-            String readName = p.getRead().getReadName();
+
+            // the element currently kept for this read's name at this locus, or -1 if there is none
+            int existingIndex = -1;
+            OverlappingFragmentTracker.Group group = null;
+            String readName = null;
+            if (tracker != null) {
+                group = tracker.groupFor(p.getRead());
+                if (group.locusSerial != locusSerial) {
+                    group.locusSerial = locusSerial;
+                    group.hasWinner = false;
+                }
+                if (group.hasWinner) { existingIndex = group.winnerIndex; }
+            } else {
+                readName = p.getRead().getReadName();
+                final Integer existingIndexOrNull = indexByName.get(readName);
+                if (existingIndexOrNull != null) { existingIndex = existingIndexOrNull; }
+            }
+
+            // the element kept for this name after looking at this one (-1: none)
+            int winnerIndex = existingIndex;
 
             // if we've never seen this read before, life is good
-            final Integer existingIndexOrNull = filteredPileup.get(readName);
-            if (existingIndexOrNull == null) {
-                filteredPileup.put(readName, i);
+            if (existingIndex == -1) {
                 elementsToKeep[i] = true;
+                winnerIndex = i;
             } else {
-                int existingIndex = existingIndexOrNull;
                 PileupElement existing = listOfElements[existingIndex];
 
                 // if the reads disagree at this position...
                 if (existing.getBase() != p.getBase()) {
                     //... and we're not retaining mismatches, throw them both out
                     if (!retainMismatches) {
-                        filteredPileup.remove(readName);
                         elementsToKeep[existingIndex] = false;
+                        winnerIndex = -1;
 
                     //... and we are retaining mismatches, keep the mismatching one
                     } else {
                         if (p.getBase() != ref) {
                             elementsToKeep[existingIndex] = false;
-                            filteredPileup.put(readName, i);
                             elementsToKeep[i] = true;
+                            winnerIndex = i;
                         }
                     }
                 // Otherwise, keep the element with the higher quality score
                 } else {
                     if (existing.getQual() < p.getQual()) {
                         elementsToKeep[existingIndex] = false;
-                        filteredPileup.put(readName, i);
                         elementsToKeep[i] = true;
+                        winnerIndex = i;
                     }
+                }
+            }
+
+            if (winnerIndex != existingIndex) {
+                if (group != null) {
+                    group.hasWinner = (winnerIndex != -1);
+                    group.winnerIndex = winnerIndex;
+                } else if (winnerIndex == -1) {
+                    indexByName.remove(readName);
+                } else {
+                    indexByName.put(readName, winnerIndex);
                 }
             }
             i++;
         }
 
         List<PileupElement> sortedList = new ArrayList<PileupElement>(rbp.getNumberOfElements());
-        for(int j=0; j<elementsToKeep.length; j++) {
+        for(int j=0; j<i; j++) {
             if (elementsToKeep[j]) { sortedList.add(listOfElements[j]); }
         }
 
@@ -248,11 +385,15 @@ public class LocusReadPile {
     }
 
     public double estimateAlleleFraction(char ref, char alt) {
-        return estimateAlleleFraction(this.finalPileup, ref, alt);
+        // from the base counts of the final pileup, gathered when the pile was built
+        return estimateAlleleFraction(finalPileupBaseCounts, ref, alt);
     }
 
     public static double estimateAlleleFraction(ReadBackedPileup pileup, char ref, char alt) {
-        int[] counts = pileup.getBaseCounts();
+        return estimateAlleleFraction(pileup.getBaseCounts(), ref, alt);
+    }
+
+    private static double estimateAlleleFraction(int[] counts, char ref, char alt) {
         double refCount = (double) counts[BaseUtils.simpleBaseToBaseIndex((byte)ref)];
         double altCount = (double) counts[BaseUtils.simpleBaseToBaseIndex((byte)alt)];
         double depth = refCount + altCount;
@@ -260,7 +401,7 @@ public class LocusReadPile {
     }
 
     public double calculateLogLikelihood(byte alt, double f) {
-        return LocusReadPile.calculateLogLikelihood(this.finalPileup, ((byte) this.refBase), alt, f);
+        return LocusReadPile.calculateLogLikelihood(getFinalPileup(), ((byte) this.refBase), alt, f);
     }
 
     public double calculateAltVsRefLOD(ReadBackedPileup pileup, byte alt, double fAlternate, double fReference) {
@@ -274,7 +415,7 @@ public class LocusReadPile {
     }
 
     public double calculateAltVsRefLOD(byte alt, double fAlternate, double fReference) {
-        return calculateAltVsRefLOD(this.finalPileup, alt, fAlternate, fReference);
+        return calculateAltVsRefLOD(getFinalPileup(), alt, fAlternate, fReference);
     }
 
     public double calculateRefVsAltLOD(ReadBackedPileup pileup, byte alt, double fAlternate, double fReference) {
@@ -342,9 +483,9 @@ public class LocusReadPile {
     }
 
     public int getFilteredBaseCount(int minBaseQualityScore) {
-        // equivalent to finalPileup.getBaseFilteredPileup(minBaseQualityScore).depthOfCoverage(), without building the pileup
+        // equivalent to getFinalPileup().getBaseFilteredPileup(minBaseQualityScore).depthOfCoverage(), without building that pileup
         int count = 0;
-        for (PileupElement p : this.finalPileup) {
+        for (PileupElement p : getFinalPileup()) {
             if (p.isDeletion() || p.getQual() >= minBaseQualityScore) { count++; }
         }
         return count;

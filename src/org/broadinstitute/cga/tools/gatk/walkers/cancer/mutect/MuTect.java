@@ -50,6 +50,7 @@
 package org.broadinstitute.cga.tools.gatk.walkers.cancer.mutect;
 
 import net.sf.picard.reference.IndexedFastaSequenceFile;
+import net.sf.samtools.SAMReadGroupRecord;
 import net.sf.samtools.SAMRecord;
 import org.apache.commons.lang.math.NumberUtils;
 import org.broadinstitute.cga.tools.gatk.utils.CGAAlignmentUtils;
@@ -183,6 +184,16 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
     private Set<SAMReaderID> tumorSAMReaderIDs = new HashSet<SAMReaderID>();
     private Set<SAMReaderID> normalSAMReaderIDs = new HashSet<SAMReaderID>();
 
+    // when the tumor BAMs hold one sample and the normal BAMs another, the engine's per-sample grouping of the
+    // pileup is used directly instead of merging the whole pileup and re-splitting it by read source at every locus
+    private boolean splitPileupBySample = false;
+    private String tumorPileupSample = null;
+    private String normalPileupSample = null;
+
+    // cross-locus bookkeeping for the overlapping-fragment filter, one per kind of pile
+    private final OverlappingFragmentTracker tumorOverlapTracker = new OverlappingFragmentTracker();
+    private final OverlappingFragmentTracker normalOverlapTracker = new OverlappingFragmentTracker();
+
     private CallStatsGenerator callStatsGenerator;
 
     @Override
@@ -209,6 +220,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         callStatsGenerator = new CallStatsGenerator(MTAC.ENABLE_QSCORE_OUTPUT);
 
         // check that we have at least one tumor bam
+        final Set<String> tumorSampleNames = new HashSet<String>();
+        final Set<String> normalSampleNames = new HashSet<String>();
         for(SAMReaderID id : getToolkit().getReadsDataSource().getReaderIDs()) {
             if (id.getTags().getPositionalTags().size() == 0) {
                 throw new RuntimeException("BAMs must be tagged as either 'tumor' or 'normal'");
@@ -218,6 +231,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 if (BAM_TAG_TUMOR.equalsIgnoreCase(tag)) {
                     hasTumorBam = true;
                     tumorSAMReaderIDs.add(id);
+                    tumorSampleNames.addAll(getSampleNames(id));
 
                     // fill in the sample name if necessary
                     if (MTAC.TUMOR_SAMPLE_NAME == null) {
@@ -233,6 +247,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 } else if (BAM_TAG_NORMAL.equalsIgnoreCase(tag)) {
                     hasNormalBam = true;
                     normalSAMReaderIDs.add(id);
+                    normalSampleNames.addAll(getSampleNames(id));
 
 
                     // fill in the sample name if necessary
@@ -255,6 +270,20 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
         if (!hasTumorBam) {
             throw new RuntimeException("At least one BAM tagged as 'tumor' required");
+        }
+
+        // splitting the pileup by sample name is equivalent to splitting it by BAM only when there is one sample
+        // on each side, no sample on both sides, and no restriction to some other tumor sample
+        if (tumorSampleNames.size() == 1 && !tumorSampleNames.contains(null) &&
+                normalSampleNames.size() == (hasNormalBam ? 1 : 0) && !normalSampleNames.contains(null) &&
+                Collections.disjoint(tumorSampleNames, normalSampleNames)) {
+            final String tumorSample = tumorSampleNames.iterator().next();
+            if (MTAC.BAM_TUMOR_SAMPLE_NAME == null || MTAC.BAM_TUMOR_SAMPLE_NAME.equals(tumorSample)) {
+                splitPileupBySample = true;
+                tumorPileupSample = tumorSample;
+                normalPileupSample = hasNormalBam ? normalSampleNames.iterator().next() : null;
+                logger.info("Pileups will be split by sample name: tumor=" + tumorPileupSample + " normal=" + normalPileupSample);
+            }
         }
 
         if (!hasNormalBam) {
@@ -343,8 +372,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
 
-            final LocusReadPile tumorReadPile =  new LocusReadPile(pileupMap.get(SampleType.TUMOR), upRef, MTAC.MIN_QSCORE, MIN_QSUM_QSCORE, false, MTAC.ARTIFACT_DETECTION_MODE, MTAC.ENABLE_QSCORE_OUTPUT);
-            final LocusReadPile normalReadPile = new LocusReadPile(pileupMap.get(SampleType.NORMAL), upRef, MTAC.MIN_QSCORE, 0, this.USE_MAPQ0_IN_NORMAL_QSCORE, true, MTAC.ENABLE_QSCORE_OUTPUT);
+            final LocusReadPile tumorReadPile =  new LocusReadPile(pileupMap.get(SampleType.TUMOR), upRef, MTAC.MIN_QSCORE, MIN_QSUM_QSCORE, false, MTAC.ARTIFACT_DETECTION_MODE, MTAC.ENABLE_QSCORE_OUTPUT, tumorOverlapTracker);
+            final LocusReadPile normalReadPile = new LocusReadPile(pileupMap.get(SampleType.NORMAL), upRef, MTAC.MIN_QSCORE, 0, this.USE_MAPQ0_IN_NORMAL_QSCORE, true, MTAC.ENABLE_QSCORE_OUTPUT, normalOverlapTracker);
 
             Collection<VariantContext> panelOfNormalsVC = tracker.getValues(normalPanelRod, rawContext.getLocation());
             Collection<VariantContext> cosmicVC = tracker.getValues(cosmicRod, rawContext.getLocation());
@@ -370,8 +399,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
             }
 
             stdCovWriter.writeCoverage(rawContext, isBaseCovered);
-            int tumorQ20BaseCount = tumorReadPile.getFilteredBaseCount(20);
-            int normalQ20BaseCount = normalReadPile.getFilteredBaseCount(20);
+            int tumorQ20BaseCount = tumorReadPile.getFinalPileupQ20Depth();
+            int normalQ20BaseCount = normalReadPile.getFinalPileupQ20Depth();
             q20CovWriter.writeCoverage(rawContext, tumorQ20BaseCount  >= 20 &&  normalQ20BaseCount >= 20);
             tumorDepthWriter.writeCoverage(rawContext, tumorBaseCount);
             normalDepthWriter.writeCoverage(rawContext, normalBaseCount);
@@ -393,12 +422,12 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
             int mapQ0Reads =
-                    tumorReadPile.qualityScoreFilteredPileup.getNumberOfMappingQualityZeroReads() +
-                            normalReadPile.qualityScoreFilteredPileup.getNumberOfMappingQualityZeroReads();
+                    tumorReadPile.getQualityScoreFilteredMappingQualityZeroCount() +
+                            normalReadPile.getQualityScoreFilteredMappingQualityZeroCount();
 
             int totalReads =
-                    tumorReadPile.qualityScoreFilteredPileup.depthOfCoverage() +
-                            normalReadPile.qualityScoreFilteredPileup.depthOfCoverage();
+                    tumorReadPile.getQualityScoreFilteredDepth() +
+                            normalReadPile.getQualityScoreFilteredDepth();
 
             // the following do not depend on the alternate allele being tested, so they are calculated
             // at most once per locus, the first time a candidate needs them
@@ -471,8 +500,8 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 VariableAllelicRatioGenotypeLikelihoods contaminantLikelihoods
                         = new VariableAllelicRatioGenotypeLikelihoods(upRef, contaminantF);
 
-                List<PileupElement> peList = new ArrayList<PileupElement>(tumorReadPile.finalPileup.depthOfCoverage());
-                for(PileupElement pe : tumorReadPile.finalPileup) {
+                List<PileupElement> peList = new ArrayList<PileupElement>(tumorReadPile.getFinalPileup().depthOfCoverage());
+                for(PileupElement pe : tumorReadPile.getFinalPileup()) {
                     peList.add(pe);
                 }
 
@@ -500,13 +529,13 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
 
                 if (normalGl == null) {
-                    normalGl = normalReadPile.calculateLikelihoods(normalReadPile.qualityScoreFilteredPileup); // use MAPQ0 reads
+                    normalGl = normalReadPile.calculateLikelihoods(normalReadPile.getQualityScoreFilteredPileup()); // use MAPQ0 reads
                 }
                 candidate.setInitialNormalBestGenotype(normalReadPile.getBestGenotype(normalGl));
                 candidate.setInitialNormalLod(LocusReadPile.getRefVsAlt(normalGl, upRef, altAllele));
 
 
-                double normalF = Math.max(LocusReadPile.estimateAlleleFraction(normalReadPile.qualityScoreFilteredPileup, upRef, altAllele), MTAC.MINIMUM_NORMAL_ALLELE_FRACTION);
+                double normalF = Math.max(LocusReadPile.estimateAlleleFraction(normalReadPile.getQualityScoreFilteredPileup(), upRef, altAllele), MTAC.MINIMUM_NORMAL_ALLELE_FRACTION);
                 candidate.setNormalF(normalF);
 
 
@@ -522,7 +551,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
 
                 // TODO: parameterize filtering Mate-Rescued Reads (if someone wants to disable this)
                 if (t2 == null) {
-                    t2 = new LocusReadPile(filterReads(ref, tumorReadPile.finalPileup, true, readFilterCache), (char)ref.getBase(), 0, 0, MTAC.ENABLE_QSCORE_OUTPUT);
+                    t2 = new LocusReadPile(filterReads(ref, tumorReadPile.getFinalPileup(), true, readFilterCache), (char)ref.getBase(), 0, 0, MTAC.ENABLE_QSCORE_OUTPUT);
                 }
 
                 // if there are no reads remaining, abandon this theory
@@ -536,7 +565,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 candidate.setTumorAltQualityScores(t2.qualitySums.getBaseQualityScores(altAllele));
                 candidate.setTumorRefQualityScores(t2.qualitySums.getBaseQualityScores(upRef));
 
-                VariableAllelicRatioGenotypeLikelihoods t2Gl = t2.calculateLikelihoods(t2.finalPileup);
+                VariableAllelicRatioGenotypeLikelihoods t2Gl = t2.calculateLikelihoods(t2.getFinalPileup());
                 candidate.setInitialTumorLod(t2.getAltVsRef(t2Gl, upRef, altAllele));
                 candidate.setInitialTumorReadDepth(t2.getFinalPileupDepth());
 
@@ -573,7 +602,7 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
                 ArrayList<PileupElement> referencePileupElements = new ArrayList<PileupElement>();
 
 
-                for (PileupElement p : t2.finalPileup) {
+                for (PileupElement p : t2.getFinalPileup()) {
                     // the base in the read at this position (equivalent to read.getReadString().charAt(offset))
                     final char readBase = (char) (p.getRead().getReadBases()[p.getOffset()] & 0xFF);
 
@@ -741,6 +770,15 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
         return 0;
     }
 
+    @Override
+    public void onTraversalDone(Integer result) {
+        // the wiggle writers buffer their output; write what is still buffered before GATK closes the streams
+        for (CoverageWiggleFileWriter writer : new CoverageWiggleFileWriter[]{stdCovWriter, q20CovWriter, powerWriter, tumorDepthWriter, normalDepthWriter}) {
+            if (writer != null) { writer.flush(); }
+        }
+        super.onTraversalDone(result);
+    }
+
     // Given result of map function
     @Override
     public Integer reduceInit() {
@@ -752,8 +790,38 @@ public class MuTect extends LocusWalker<Integer, Integer>  {
     }
 
 
+    // the sample names in the read groups of one BAM (empty if they cannot be determined)
+    private Set<String> getSampleNames(SAMReaderID id) {
+        final Set<String> names = new HashSet<String>();
+        try {
+            for (SAMReadGroupRecord rg : getToolkit().getReadsDataSource().getHeader(id).getReadGroups()) {
+                names.add(rg.getSample());
+            }
+        } catch (NullPointerException npe) {
+            // no header available; the pileup is split by read source instead
+        }
+        return names;
+    }
+
     protected Map<SampleType, ReadBackedPileup> getPileupsBySampleType(ReadBackedPileup pileup) {
         Map<SampleType, ReadBackedPileup> result = new HashMap<SampleType, ReadBackedPileup>();
+
+        if (splitPileupBySample) {
+            // the engine keeps the pileup grouped by sample, so each side's elements are fetched directly.  A merge
+            // preserves the order within each sample, so these are the same elements in the same order as the
+            // read-source split below produces.  Bases called as N are dropped by LocusReadPile instead of here.
+            final ReadBackedPileup tumorPileup = pileup.getPileupForSample(tumorPileupSample);
+            final ReadBackedPileup normalPileup = (normalPileupSample == null) ? null : pileup.getPileupForSample(normalPileupSample);
+            final int tumorSize = (tumorPileup == null) ? 0 : tumorPileup.getNumberOfElements();
+            final int normalSize = (normalPileup == null) ? 0 : normalPileup.getNumberOfElements();
+
+            // only when the two samples account for every element; otherwise fall through to the read-source split
+            if (tumorSize + normalSize == pileup.getNumberOfElements()) {
+                result.put(SampleType.TUMOR, (tumorPileup != null) ? tumorPileup : new ReadBackedPileupImpl(pileup.getLocation(), new ArrayList<PileupElement>()));
+                result.put(SampleType.NORMAL, (normalPileup != null) ? normalPileup : new ReadBackedPileupImpl(pileup.getLocation(), new ArrayList<PileupElement>()));
+                return result;
+            }
+        }
 
         ArrayList<PileupElement> tumorPileupElements = new ArrayList<PileupElement>();
         ArrayList<PileupElement> normalPileupElements = new ArrayList<PileupElement>();

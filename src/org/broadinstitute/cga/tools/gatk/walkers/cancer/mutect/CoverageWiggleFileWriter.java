@@ -56,6 +56,11 @@ import java.io.PrintStream;
 
 /**
  * Handles writing of wiggle format coverage data to an underlying PrintStream from GATK
+ *
+ * Output is accumulated as bytes in a buffer and handed to the stream in large blocks, rather than one
+ * PrintStream.print per locus (each of which runs through the charset encoder and a flush).  The bytes
+ * written are the same as before.  flush() must be called once traversal is complete so that the tail of
+ * the buffer reaches the stream before it is closed.
  */
 public class CoverageWiggleFileWriter {
     protected PrintStream ps;
@@ -65,6 +70,10 @@ public class CoverageWiggleFileWriter {
 
     private final FormatUtil fmt = new FormatUtil();
 
+    private static final int BUFFER_SIZE = 1 << 16;
+    private final byte[] buffer;
+    private int bufferLength = 0;
+
 
     public CoverageWiggleFileWriter(PrintStream ps) {
         this(ps, "SomaticCoverage");
@@ -72,56 +81,108 @@ public class CoverageWiggleFileWriter {
 
     public CoverageWiggleFileWriter(PrintStream ps, String trackName) {
         this.ps = ps;
+        this.buffer = hasPrintStream() ? new byte[BUFFER_SIZE] : null;
 
-        safePrint("track type=wiggle_0 name=" + trackName + "\n");
+        append("track type=wiggle_0 name=" + trackName + "\n");
     }
 
     private boolean hasPrintStream() {
         return (ps != null);
     }
 
-    private void safePrint(String s) {
-        if (hasPrintStream()) {
-            ps.print(s);
+    /**
+     * Writes any buffered output to the underlying stream.  Must be called when traversal is complete.
+     */
+    public void flush() {
+        if (hasPrintStream() && bufferLength > 0) {
+            ps.write(buffer, 0, bufferLength);
+            bufferLength = 0;
         }
+    }
+
+    private void append(final String s) {
+        if (!hasPrintStream()) { return; }
+
+        // the output is ASCII; anything else is encoded exactly as PrintStream would have (platform default charset)
+        final int length = s.length();
+        for (int i = 0; i < length; i++) {
+            if (s.charAt(i) >= 128) {
+                append(s.getBytes());
+                return;
+            }
+        }
+
+        if (length > buffer.length - bufferLength) { flush(); }
+        if (length > buffer.length) {
+            ps.write(s.getBytes(), 0, length);
+            return;
+        }
+        for (int i = 0; i < length; i++) {
+            buffer[bufferLength++] = (byte) s.charAt(i);
+        }
+    }
+
+    private void append(final byte[] bytes) {
+        if (bytes.length > buffer.length - bufferLength) { flush(); }
+        if (bytes.length > buffer.length) {
+            ps.write(bytes, 0, bytes.length);
+            return;
+        }
+        System.arraycopy(bytes, 0, buffer, bufferLength, bytes.length);
+        bufferLength += bytes.length;
+    }
+
+    // same characters as StringBuilder.append(long)
+    private void append(final long value) {
+        if (!hasPrintStream()) { return; }
+        if (value < 0) {
+            append(Long.toString(value));
+            return;
+        }
+
+        int digits = 1;
+        for (long v = value; v >= 10; v /= 10) { digits++; }
+
+        if (digits > buffer.length - bufferLength) { flush(); }
+        int position = bufferLength + digits;
+        long v = value;
+        do {
+            buffer[--position] = (byte) ('0' + (v % 10));
+            v /= 10;
+        } while (v > 0);
+        bufferLength += digits;
     }
 
     public void writeCoverage(final AlignmentContext context, final boolean isBaseCovered) {
         writeCoverage(context, isBaseCovered?1:0);
     }
 
-    public void possiblyGenerateHeader(StringBuilder sb, AlignmentContext context) {
+    private void possiblyGenerateHeader(final AlignmentContext context) {
         if (this.lastContigIndex != context.getLocation().getContigIndex() ||
             this.lastPosition + 1 != context.getPosition()) {
                 this.lastContigIndex = context.getLocation().getContigIndex();
-                sb.append("fixedStep").append(" ")
-                  .append("chrom=").append(context.getContig()).append(" ")
-                  .append("start=").append(context.getPosition()).append(" ")
-                  .append("step=1")
-                  .append("\n");
+                append("fixedStep chrom=");
+                append(context.getContig());
+                append(" start=");
+                append(context.getPosition());
+                append(" step=1\n");
         }
         this.lastPosition = context.getPosition();
     }
 
     public void writeCoverage(final AlignmentContext context, final int depth) {
         if (hasPrintStream()) {
-            final StringBuilder sb = new StringBuilder();
-            possiblyGenerateHeader(sb,context);
-
-            sb.append(depth).append("\n");
-
-            safePrint(sb.toString());
+            possiblyGenerateHeader(context);
+            append(depth);
+            append("\n");
         }
     }
 
     public void writeCoverage(final AlignmentContext context, final double power) {
         if (hasPrintStream()) {
-            final StringBuilder sb = new StringBuilder();
-            possiblyGenerateHeader(sb,context);
-
-            sb.append(fmt.format(power)).append("\n");
-
-            safePrint(sb.toString());
+            possiblyGenerateHeader(context);
+            append(fmt.format(power));
+            append("\n");
         }
     }
 

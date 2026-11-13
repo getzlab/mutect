@@ -92,23 +92,21 @@ public class TumorPowerCalculator extends AbstractPowerCalculator{
         // calculate the probability of each configuration
         double p_alt_given_e_delta = delta*(1d-eps) + (1d-delta)*eps;
         BinomialDistribution binom = new BinomialDistributionImpl(depth, p_alt_given_e_delta);
-        double[] p = new double[depth+1];
-        for(int i=0; i<p.length; i++) {
-            p[i] = binom.probability(i);
-        }
 
-        // calculate the LOD scores
-        double[] lod = new double[depth+1];
-        for(int i=0; i<lod.length; i++) {
-            lod[i] = calculateTumorLod(depth, i, eps, contam);
-        }
-
+        // calculate the LOD scores, up to the first that reaches the threshold: the scores and probabilities
+        // of every configuration used to be tabulated here, which at a depth in the hundreds of thousands
+        // (never seen before, so not in the cache) cost more than the rest of the locus
         int k = -1;
-        for(int i=0; i<lod.length; i++) {
-            if (lod[i] >= lodThreshold) {
+        double lodAtK = 0;
+        double lodBeforeK = 0;
+        for(int i=0; i<=depth; i++) {
+            final double lod = calculateTumorLod(depth, i, eps, contam);
+            if (lod >= lodThreshold) {
                 k = i;
+                lodAtK = lod;
                 break;
             }
+            lodBeforeK = lod;
         }
 
         // if no depth meets the lod score, the power is zero
@@ -123,15 +121,12 @@ public class TumorPowerCalculator extends AbstractPowerCalculator{
         // the k and k-1 bin, so we prorate the power from that bin
         // if k==0, it must be that lodThreshold == lod[k] so we don't have to make this correction
         if ( enableSmoothing && k > 0 ) {
-            double x = 1d - (lodThreshold - lod[k-1]) / (lod[k] - lod[k-1]);
-            power = x*p[k-1];
+            double x = 1d - (lodThreshold - lodBeforeK) / (lodAtK - lodBeforeK);
+            power = x*binom.probability(k-1);
         }
 
-        for(int i=k; i<p.length; i++) {
-            power += p[i];
-        }
-
-        return(power);
+        // add the probability of each configuration from k up
+        return addProbabilities(power, binom, depth, p_alt_given_e_delta, k, false);
     }
 
 }
